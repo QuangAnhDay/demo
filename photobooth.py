@@ -4,10 +4,14 @@ import cv2
 import time
 import subprocess
 import numpy as np
+import qrcode
+from io import BytesIO
+from PIL import Image
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, 
                              QPushButton, QVBoxLayout, QHBoxLayout, QScrollArea, 
-                             QMessageBox, QFrame, QGridLayout, QStackedWidget)
-from PyQt5.QtCore import Qt, QTimer, QSize
+                             QMessageBox, QFrame, QGridLayout, QStackedWidget,
+                             QGraphicsOpacityEffect)
+from PyQt5.QtCore import Qt, QTimer, QSize, QPropertyAnimation, QPoint, QEasingCurve, QSequentialAnimationGroup, QParallelAnimationGroup
 from PyQt5.QtGui import QImage, QPixmap, QFont, QIcon
 
 # ==========================================
@@ -22,6 +26,15 @@ BETWEEN_PHOTO_DELAY = 7  # Giây giữa các ảnh
 PHOTOS_TO_TAKE = 10
 TEMPLATE_DIR = "templates"
 OUTPUT_DIR = "output"
+SAMPLE_PHOTOS_DIR = "sample_photos"
+
+# Cấu hình giá tiền
+PRICE_2_PHOTOS = "20.000 VNĐ"
+PRICE_4_PHOTOS = "35.000 VNĐ"
+
+# Thông tin thanh toán (ví dụ: số tài khoản, momo, etc.)
+PAYMENT_INFO = "MOMO: 0123456789 - NGUYEN VAN A"
+QR_CONTENT = "https://momosv3.apimienphi.com/api/QRCode?phone=0123456789&amount=20000&note=ThanhToanPhotobooth"
 
 # ==========================================
 # HÀM HỖ TRỢ (HELPER FUNCTIONS)
@@ -34,6 +47,9 @@ def ensure_directories():
         create_sample_templates()
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
+    if not os.path.exists(SAMPLE_PHOTOS_DIR):
+        os.makedirs(SAMPLE_PHOTOS_DIR)
+        create_sample_photos()
 
 def create_sample_templates():
     """Tạo các template mẫu."""
@@ -52,6 +68,57 @@ def create_sample_templates():
     cv2.putText(img2, "MEMORIES", (width//2 - 150, 60), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255, 255), 4)
     img2[80:height-40, 40:width-40] = [0, 0, 0, 0]
     cv2.imwrite(os.path.join(TEMPLATE_DIR, "frame_blue.png"), img2)
+
+def create_sample_photos():
+    """Tạo các ảnh mẫu demo."""
+    colors = [
+        ((255, 100, 150), "Memory 1"),
+        ((100, 200, 255), "Memory 2"),
+        ((150, 255, 150), "Memory 3"),
+        ((255, 200, 100), "Memory 4"),
+        ((200, 150, 255), "Memory 5"),
+        ((100, 255, 200), "Memory 6"),
+        ((255, 150, 200), "Memory 7"),
+        ((150, 200, 255), "Memory 8"),
+    ]
+    
+    for i, (color, text) in enumerate(colors):
+        img = np.zeros((400, 300, 3), dtype=np.uint8)
+        # Gradient background
+        for y in range(400):
+            ratio = y / 400
+            img[y, :] = (
+                int(color[0] * (1 - ratio * 0.5)),
+                int(color[1] * (1 - ratio * 0.5)),
+                int(color[2] * (1 - ratio * 0.5))
+            )
+        # Add text
+        cv2.putText(img, text, (50, 200), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        cv2.putText(img, "Sample", (80, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.imwrite(os.path.join(SAMPLE_PHOTOS_DIR, f"sample_{i+1}.jpg"), img)
+
+def generate_qr_code(content, size=300):
+    """Tạo mã QR từ nội dung."""
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(content)
+    qr.make(fit=True)
+    
+    qr_img = qr.make_image(fill_color="black", back_color="white")
+    qr_img = qr_img.resize((size, size))
+    
+    # Convert PIL Image to QPixmap
+    buffer = BytesIO()
+    qr_img.save(buffer, format="PNG")
+    buffer.seek(0)
+    
+    q_img = QImage()
+    q_img.loadFromData(buffer.getvalue())
+    return QPixmap.fromImage(q_img)
 
 def overlay_images(background, foreground):
     """Ghép ảnh foreground (có alpha) lên background."""
@@ -104,6 +171,119 @@ def check_printer_available():
     except Exception as e:
         return False, str(e)
 
+def load_sample_photos():
+    """Load các ảnh mẫu từ thư mục."""
+    photos = []
+    if os.path.exists(SAMPLE_PHOTOS_DIR):
+        for f in sorted(os.listdir(SAMPLE_PHOTOS_DIR)):
+            if f.lower().endswith(('.jpg', '.jpeg', '.png')):
+                photos.append(os.path.join(SAMPLE_PHOTOS_DIR, f))
+    # Load từ output nếu có
+    if os.path.exists(OUTPUT_DIR):
+        for f in sorted(os.listdir(OUTPUT_DIR)):
+            if f.lower().endswith(('.jpg', '.jpeg', '.png')):
+                photos.append(os.path.join(OUTPUT_DIR, f))
+    return photos
+
+# ==========================================
+# CAROUSEL PHOTO WIDGET
+# ==========================================
+
+class CarouselPhotoWidget(QWidget):
+    """Widget hiển thị ảnh carousel trôi từ trái sang phải."""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.photos = []
+        self.photo_labels = []
+        self.current_offset = 0
+        self.photo_width = 220
+        self.photo_height = 280
+        self.spacing = 20
+        self.scroll_speed = 2  # pixels per frame
+        
+        self.setMinimumHeight(self.photo_height + 40)
+        
+        # Timer cho animation
+        self.scroll_timer = QTimer()
+        self.scroll_timer.timeout.connect(self.update_scroll)
+        self.scroll_timer.start(30)  # ~33 FPS
+        
+    def set_photos(self, photo_paths):
+        """Đặt danh sách ảnh cho carousel."""
+        self.photos = photo_paths
+        self.setup_photo_labels()
+        
+    def setup_photo_labels(self):
+        """Tạo các label ảnh cho carousel."""
+        # Xóa các label cũ
+        for label in self.photo_labels:
+            label.deleteLater()
+        self.photo_labels = []
+        
+        if not self.photos:
+            return
+        
+        # Nhân đôi ảnh để tạo hiệu ứng vòng lặp liền mạch
+        total_photos = self.photos * 3  # Nhân 3 lần để có đủ ảnh cho vòng lặp
+        
+        for i, photo_path in enumerate(total_photos):
+            label = QLabel(self)
+            label.setFixedSize(self.photo_width, self.photo_height)
+            label.setAlignment(Qt.AlignCenter)
+            label.setStyleSheet("""
+                QLabel {
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                        stop:0 #2d2d44, stop:1 #1a1a2e);
+                    border: 3px solid #4361ee;
+                    border-radius: 15px;
+                    padding: 5px;
+                }
+            """)
+            
+            # Load và scale ảnh
+            img = cv2.imread(photo_path)
+            if img is not None:
+                qt_img = convert_cv_qt(img)
+                scaled = qt_img.scaled(
+                    self.photo_width - 16, 
+                    self.photo_height - 16, 
+                    Qt.KeepAspectRatio, 
+                    Qt.SmoothTransformation
+                )
+                label.setPixmap(scaled)
+            
+            label.show()
+            self.photo_labels.append(label)
+        
+        self.update_positions()
+    
+    def update_positions(self):
+        """Cập nhật vị trí các ảnh."""
+        if not self.photo_labels:
+            return
+            
+        y_pos = 20
+        total_width = len(self.photo_labels) * (self.photo_width + self.spacing)
+        
+        for i, label in enumerate(self.photo_labels):
+            x_pos = i * (self.photo_width + self.spacing) - self.current_offset
+            label.move(int(x_pos), y_pos)
+    
+    def update_scroll(self):
+        """Cập nhật vị trí scroll."""
+        if not self.photo_labels or not self.photos:
+            return
+        
+        self.current_offset += self.scroll_speed
+        
+        # Reset offset khi đã cuộn qua 1 bộ ảnh
+        single_set_width = len(self.photos) * (self.photo_width + self.spacing)
+        if self.current_offset >= single_set_width:
+            self.current_offset = 0
+        
+        self.update_positions()
+
 # ==========================================
 # GIAO DIỆN CHÍNH (MAIN GUI)
 # ==========================================
@@ -127,6 +307,11 @@ class PhotoboothApp(QMainWindow):
                 font-weight: bold;
                 color: #eaf0f6;
             }
+            QLabel#SubTitleLabel {
+                font-size: 24px;
+                font-weight: bold;
+                color: #ffd700;
+            }
             QLabel#CountdownLabel {
                 font-size: 120px;
                 font-weight: bold;
@@ -135,6 +320,11 @@ class PhotoboothApp(QMainWindow):
             QLabel#InfoLabel {
                 font-size: 24px;
                 color: #a8dadc;
+            }
+            QLabel#PriceLabel {
+                font-size: 28px;
+                font-weight: bold;
+                color: #06d6a0;
             }
             QPushButton {
                 background-color: #e94560;
@@ -156,6 +346,18 @@ class PhotoboothApp(QMainWindow):
             QPushButton#OrangeBtn:hover { background-color: #ffb703; }
             QPushButton#BlueBtn { background-color: #4361ee; }
             QPushButton#BlueBtn:hover { background-color: #4cc9f0; }
+            QPushButton#PriceBtn {
+                background-color: #16213e;
+                border: 4px solid #4361ee;
+                border-radius: 25px;
+                padding: 30px;
+                min-height: 180px;
+                min-width: 280px;
+            }
+            QPushButton#PriceBtn:hover { 
+                background-color: #0f3460; 
+                border-color: #e94560;
+            }
             QPushButton#FrameBtn {
                 background-color: #16213e;
                 border: 3px solid #0f3460;
@@ -183,17 +385,34 @@ class PhotoboothApp(QMainWindow):
             QWidget#PhotoCard:hover {
                 border-color: #e94560;
             }
+            QWidget#GalleryPanel {
+                background-color: #0f0f23;
+            }
+            QWidget#StartPanel {
+                background-color: #1a1a2e;
+                border-left: 2px solid #4361ee;
+            }
+            QWidget#QRPanel {
+                background-color: white;
+                border-radius: 20px;
+                padding: 20px;
+            }
         """)
 
         # --- STATE MANAGEMENT ---
-        self.state = "START"  # START, CAPTURING, FRAME_SELECT, PHOTO_SELECT, TEMPLATE_SELECT, CONFIRM, PRINTING
+        self.state = "START"  # START, PRICE_SELECT, QR_PAYMENT, CAPTURING, PHOTO_SELECT, TEMPLATE_SELECT, CONFIRM, PRINTING
         self.captured_photos = []
-        self.selected_frame_count = 0  # 1, 2, hoặc 4
+        self.selected_frame_count = 0  # 2 hoặc 4
         self.selected_photo_indices = []
         self.collage_image = None
         self.merged_image = None
         self.current_frame = None
         self.countdown_val = 0
+        self.selected_price_type = 0  # 2 hoặc 4
+        self.payment_confirmed = False
+        
+        # Ảnh mẫu cho gallery
+        self.gallery_photos = load_sample_photos()
         
         # --- CAMERA ---
         self.cap = cv2.VideoCapture(CAMERA_INDEX)
@@ -204,20 +423,21 @@ class PhotoboothApp(QMainWindow):
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.main_layout = QVBoxLayout(self.central_widget)
-        self.main_layout.setContentsMargins(20, 20, 20, 20)
-        self.main_layout.setSpacing(15)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
+        self.main_layout.setSpacing(0)
 
         # --- STACKED WIDGET cho các màn hình ---
         self.stacked = QStackedWidget()
         self.main_layout.addWidget(self.stacked)
 
-        # Tạo các màn hình
-        self.create_start_screen()       # Index 0
-        self.create_capture_screen()     # Index 1
-        self.create_frame_select_screen() # Index 2
-        self.create_photo_select_screen() # Index 3
-        self.create_template_select_screen() # Index 4
-        self.create_confirm_screen()     # Index 5
+        # Tạo các màn hình (bỏ màn hình chọn kiểu khung)
+        self.create_welcome_screen()      # Index 0 - Màn hình welcome mới
+        self.create_price_select_screen() # Index 1 - Chọn giá tiền
+        self.create_qr_payment_screen()   # Index 2 - Hiển thị QR
+        self.create_capture_screen()      # Index 3
+        self.create_photo_select_screen() # Index 4
+        self.create_template_select_screen() # Index 5
+        self.create_confirm_screen()      # Index 6
 
         # --- TIMER ---
         self.camera_timer = QTimer()
@@ -234,29 +454,304 @@ class PhotoboothApp(QMainWindow):
     # TẠO CÁC MÀN HÌNH
     # ==========================================
 
-    def create_start_screen(self):
-        """Màn hình bắt đầu."""
+    def create_welcome_screen(self):
+        """Màn hình welcome với carousel ảnh bên trái và nút bắt đầu bên phải."""
+        screen = QWidget()
+        main_layout = QHBoxLayout(screen)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        
+        # ===== PHẦN TRÁI (2/3) - CAROUSEL ẢNH =====
+        gallery_panel = QWidget()
+        gallery_panel.setObjectName("GalleryPanel")
+        gallery_layout = QVBoxLayout(gallery_panel)
+        gallery_layout.setContentsMargins(20, 30, 20, 30)
+        gallery_layout.setSpacing(15)
+        
+        # Title cho gallery
+        gallery_title = QLabel("📸 NHỮNG KHOẢNH KHẮC ĐÁNG NHỚ")
+        gallery_title.setObjectName("TitleLabel")
+        gallery_title.setAlignment(Qt.AlignCenter)
+        gallery_layout.addWidget(gallery_title)
+        
+        # Subtitle
+        subtitle = QLabel("Những bức ảnh thành phẩm tuyệt đẹp từ Photobooth")
+        subtitle.setObjectName("InfoLabel")
+        subtitle.setAlignment(Qt.AlignCenter)
+        subtitle.setStyleSheet("color: #a8dadc; font-size: 16px;")
+        gallery_layout.addWidget(subtitle)
+        
+        # Carousel widget - Hàng 1
+        self.carousel1 = CarouselPhotoWidget()
+        self.carousel1.scroll_speed = 2
+        gallery_layout.addWidget(self.carousel1)
+        
+        # Carousel widget - Hàng 2 (ngược chiều)
+        self.carousel2 = CarouselPhotoWidget()
+        self.carousel2.scroll_speed = -2  # Ngược chiều
+        gallery_layout.addWidget(self.carousel2)
+        
+        # Thông tin bổ sung
+        info_text = QLabel("✨ Tạo kỷ niệm tuyệt vời cùng chúng tôi! ✨")
+        info_text.setAlignment(Qt.AlignCenter)
+        info_text.setStyleSheet("color: #ffd700; font-size: 20px; font-weight: bold;")
+        gallery_layout.addWidget(info_text)
+        
+        gallery_layout.addStretch()
+        
+        main_layout.addWidget(gallery_panel, stretch=2)
+        
+        # ===== PHẦN PHẢI (1/3) - NÚT BẮT ĐẦU =====
+        start_panel = QWidget()
+        start_panel.setObjectName("StartPanel")
+        start_layout = QVBoxLayout(start_panel)
+        start_layout.setContentsMargins(40, 60, 40, 60)
+        start_layout.setSpacing(25)
+        start_layout.setAlignment(Qt.AlignCenter)
+        
+        # Logo/Icon
+        logo_label = QLabel("📷")
+        logo_label.setStyleSheet("font-size: 80px;")
+        logo_label.setAlignment(Qt.AlignCenter)
+        start_layout.addWidget(logo_label)
+        
+        # Title
+        title = QLabel("PHOTOBOOTH")
+        title.setObjectName("TitleLabel")
+        title.setAlignment(Qt.AlignCenter)
+        start_layout.addWidget(title)
+        
+        # Subtitle
+        welcome_text = QLabel("Chào mừng bạn!\nNhấn nút bên dưới để bắt đầu")
+        welcome_text.setObjectName("InfoLabel")
+        welcome_text.setAlignment(Qt.AlignCenter)
+        welcome_text.setWordWrap(True)
+        welcome_text.setStyleSheet("color: #a8dadc; font-size: 18px;")
+        start_layout.addWidget(welcome_text)
+        
+        start_layout.addStretch()
+        
+        # Nút bắt đầu chụp
+        self.btn_start_welcome = QPushButton("🎬 BẮT ĐẦU CHỤP")
+        self.btn_start_welcome.setObjectName("GreenBtn")
+        self.btn_start_welcome.setFixedSize(280, 90)
+        self.btn_start_welcome.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #06d6a0, stop:1 #00f5d4);
+                color: #1a1a2e;
+                border: none;
+                border-radius: 20px;
+                padding: 20px 40px;
+                font-size: 24px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #00f5d4, stop:1 #06d6a0);
+            }
+            QPushButton:pressed {
+                background-color: #04a777;
+            }
+        """)
+        self.btn_start_welcome.clicked.connect(self.go_to_price_select)
+        start_layout.addWidget(self.btn_start_welcome, alignment=Qt.AlignCenter)
+        
+        start_layout.addStretch()
+        
+        # Info
+        info_label = QLabel("💡 Chụp lên đến 10 ảnh\n🖼️ Chọn khung ảnh đẹp\n🖨️ In ngay tại chỗ")
+        info_label.setAlignment(Qt.AlignCenter)
+        info_label.setStyleSheet("color: #a8dadc; font-size: 14px;")
+        start_layout.addWidget(info_label)
+        
+        main_layout.addWidget(start_panel, stretch=1)
+        
+        self.stacked.addWidget(screen)
+        
+        # Load ảnh cho carousel
+        self.load_carousel_photos()
+
+    def load_carousel_photos(self):
+        """Load ảnh vào carousel."""
+        if self.gallery_photos:
+            # Chia ảnh thành 2 hàng
+            half = len(self.gallery_photos) // 2
+            self.carousel1.set_photos(self.gallery_photos[:max(half, 4)])
+            self.carousel2.set_photos(self.gallery_photos[half:] if half > 0 else self.gallery_photos[:4])
+        else:
+            # Tạo ảnh mẫu nếu không có
+            self.carousel1.set_photos([])
+            self.carousel2.set_photos([])
+
+    def create_price_select_screen(self):
+        """Màn hình chọn giá tiền (2 ảnh hoặc 4 ảnh)."""
         screen = QWidget()
         layout = QVBoxLayout(screen)
         layout.setAlignment(Qt.AlignCenter)
         layout.setSpacing(40)
-
-        title = QLabel("📸 PHOTOBOOTH")
+        layout.setContentsMargins(50, 50, 50, 50)
+        
+        # Title
+        title = QLabel("💳 CHỌN GÓI CHỤP ẢNH")
         title.setObjectName("TitleLabel")
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
-
-        subtitle = QLabel("Chạm vào nút bên dưới để bắt đầu chụp ảnh!")
+        
+        subtitle = QLabel("Hãy chọn gói phù hợp với bạn")
         subtitle.setObjectName("InfoLabel")
         subtitle.setAlignment(Qt.AlignCenter)
         layout.addWidget(subtitle)
+        
+        # Price options
+        options_layout = QHBoxLayout()
+        options_layout.setSpacing(60)
+        options_layout.setAlignment(Qt.AlignCenter)
+        
+        # Option 1: 2 ảnh
+        self.btn_price_2 = QPushButton(f"🖼️🖼️\n\n2 ẢNH\n\n{PRICE_2_PHOTOS}")
+        self.btn_price_2.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #16213e, stop:1 #0f3460);
+                border: 4px solid #4361ee;
+                border-radius: 25px;
+                padding: 30px;
+                min-height: 200px;
+                min-width: 300px;
+                font-size: 24px;
+                font-weight: bold;
+                color: white;
+            }
+            QPushButton:hover { 
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #0f3460, stop:1 #16213e);
+                border-color: #06d6a0;
+            }
+        """)
+        self.btn_price_2.clicked.connect(lambda: self.select_price(2))
+        options_layout.addWidget(self.btn_price_2)
+        
+        # Option 2: 4 ảnh
+        self.btn_price_4 = QPushButton(f"🖼️🖼️\n🖼️🖼️\n\n4 ẢNH\n\n{PRICE_4_PHOTOS}")
+        self.btn_price_4.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #16213e, stop:1 #0f3460);
+                border: 4px solid #e94560;
+                border-radius: 25px;
+                padding: 30px;
+                min-height: 200px;
+                min-width: 300px;
+                font-size: 24px;
+                font-weight: bold;
+                color: white;
+            }
+            QPushButton:hover { 
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #0f3460, stop:1 #16213e);
+                border-color: #06d6a0;
+            }
+        """)
+        self.btn_price_4.clicked.connect(lambda: self.select_price(4))
+        options_layout.addWidget(self.btn_price_4)
+        
+        layout.addLayout(options_layout)
+        
+        # Back button
+        self.btn_back_price = QPushButton("⬅️ QUAY LẠI")
+        self.btn_back_price.setObjectName("OrangeBtn")
+        self.btn_back_price.setFixedSize(200, 60)
+        self.btn_back_price.clicked.connect(self.reset_all)
+        layout.addWidget(self.btn_back_price, alignment=Qt.AlignCenter)
+        
+        self.stacked.addWidget(screen)
 
-        self.btn_start = QPushButton("BẮT ĐẦU CHỤP")
-        self.btn_start.setObjectName("GreenBtn")
-        self.btn_start.setFixedSize(400, 100)
-        self.btn_start.clicked.connect(self.start_capture_session)
-        layout.addWidget(self.btn_start, alignment=Qt.AlignCenter)
-
+    def create_qr_payment_screen(self):
+        """Màn hình hiển thị mã QR để thanh toán."""
+        screen = QWidget()
+        layout = QVBoxLayout(screen)
+        layout.setAlignment(Qt.AlignCenter)
+        layout.setSpacing(30)
+        layout.setContentsMargins(50, 30, 50, 30)
+        
+        # Title
+        title = QLabel("📱 QUÉT MÃ ĐỂ THANH TOÁN")
+        title.setObjectName("TitleLabel")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+        
+        # Thông tin gói đã chọn
+        self.selected_package_label = QLabel()
+        self.selected_package_label.setObjectName("SubTitleLabel")
+        self.selected_package_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.selected_package_label)
+        
+        # QR Code container
+        qr_container = QWidget()
+        qr_container.setStyleSheet("""
+            background-color: white;
+            border-radius: 25px;
+            padding: 30px;
+        """)
+        qr_container.setFixedSize(400, 400)
+        qr_layout = QVBoxLayout(qr_container)
+        qr_layout.setAlignment(Qt.AlignCenter)
+        
+        self.qr_label = QLabel()
+        self.qr_label.setAlignment(Qt.AlignCenter)
+        self.qr_label.setFixedSize(320, 320)
+        qr_layout.addWidget(self.qr_label)
+        
+        layout.addWidget(qr_container, alignment=Qt.AlignCenter)
+        
+        # Payment info
+        payment_info_label = QLabel(PAYMENT_INFO)
+        payment_info_label.setObjectName("InfoLabel")
+        payment_info_label.setAlignment(Qt.AlignCenter)
+        payment_info_label.setStyleSheet("color: #ffd700; font-size: 20px;")
+        layout.addWidget(payment_info_label)
+        
+        # Hướng dẫn
+        instruction = QLabel("Sau khi thanh toán, nhấn nút bên dưới để tiếp tục")
+        instruction.setAlignment(Qt.AlignCenter)
+        instruction.setStyleSheet("color: #a8dadc; font-size: 18px;")
+        layout.addWidget(instruction)
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(30)
+        
+        self.btn_back_qr = QPushButton("⬅️ QUAY LẠI")
+        self.btn_back_qr.setObjectName("OrangeBtn")
+        self.btn_back_qr.setFixedSize(200, 70)
+        self.btn_back_qr.clicked.connect(self.go_to_price_select)
+        btn_layout.addWidget(self.btn_back_qr)
+        
+        self.btn_payment_done = QPushButton("✅ ĐÃ THANH TOÁN")
+        self.btn_payment_done.setObjectName("GreenBtn")
+        self.btn_payment_done.setFixedSize(300, 70)
+        self.btn_payment_done.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #06d6a0, stop:1 #00f5d4);
+                color: #1a1a2e;
+                border: none;
+                border-radius: 15px;
+                padding: 20px 40px;
+                font-size: 24px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #00f5d4, stop:1 #06d6a0);
+            }
+        """)
+        self.btn_payment_done.clicked.connect(self.confirm_payment)
+        btn_layout.addWidget(self.btn_payment_done)
+        
+        layout.addLayout(btn_layout)
+        
         self.stacked.addWidget(screen)
 
     def create_capture_screen(self):
@@ -264,6 +759,7 @@ class PhotoboothApp(QMainWindow):
         screen = QWidget()
         layout = QVBoxLayout(screen)
         layout.setSpacing(10)
+        layout.setContentsMargins(20, 20, 20, 20)
 
         # Camera view
         self.camera_label = QLabel("Đang khởi động camera...")
@@ -298,56 +794,14 @@ class PhotoboothApp(QMainWindow):
 
         self.stacked.addWidget(screen)
 
-    def create_frame_select_screen(self):
-        """Màn hình chọn kiểu khung (1, 2, hoặc 4 ảnh)."""
-        screen = QWidget()
-        layout = QVBoxLayout(screen)
-        layout.setAlignment(Qt.AlignCenter)
-        layout.setSpacing(30)
-
-        title = QLabel("CHỌN KIỂU KHUNG ẢNH")
-        title.setObjectName("TitleLabel")
-        title.setAlignment(Qt.AlignCenter)
-        layout.addWidget(title)
-
-        # Frame options
-        options_layout = QHBoxLayout()
-        options_layout.setSpacing(40)
-
-        self.frame_buttons = []
-        frame_options = [
-            ("1 ẢNH", 1, "🖼️"),
-            ("2 ẢNH", 2, "🖼️🖼️"),
-            ("4 ẢNH", 4, "🖼️🖼️\n🖼️🖼️")
-        ]
-
-        for label, count, icon in frame_options:
-            btn = QPushButton(f"{icon}\n\n{label}")
-            btn.setObjectName("FrameBtn")
-            btn.setCheckable(True)
-            btn.setFixedSize(250, 200)
-            btn.clicked.connect(lambda checked, c=count, b=btn: self.select_frame_type(c, b))
-            options_layout.addWidget(btn)
-            self.frame_buttons.append(btn)
-
-        layout.addLayout(options_layout)
-
-        # Confirm button
-        self.btn_confirm_frame = QPushButton("TIẾP TỤC CHỌN ẢNH")
-        self.btn_confirm_frame.setObjectName("GreenBtn")
-        self.btn_confirm_frame.setEnabled(False)
-        self.btn_confirm_frame.clicked.connect(self.go_to_photo_select)
-        layout.addWidget(self.btn_confirm_frame, alignment=Qt.AlignCenter)
-
-        self.stacked.addWidget(screen)
-
     def create_photo_select_screen(self):
         """Màn hình chọn ảnh từ 10 ảnh đã chụp."""
         screen = QWidget()
         layout = QVBoxLayout(screen)
         layout.setSpacing(15)
+        layout.setContentsMargins(20, 20, 20, 20)
 
-        self.photo_select_title = QLabel("CHỌN 1 ẢNH")
+        self.photo_select_title = QLabel("CHỌN ẢNH")
         self.photo_select_title.setObjectName("TitleLabel")
         self.photo_select_title.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.photo_select_title)
@@ -377,6 +831,7 @@ class PhotoboothApp(QMainWindow):
         screen = QWidget()
         layout = QVBoxLayout(screen)
         layout.setSpacing(15)
+        layout.setContentsMargins(20, 20, 20, 20)
 
         title = QLabel("CHỌN KHUNG VIỀN")
         title.setObjectName("TitleLabel")
@@ -428,6 +883,7 @@ class PhotoboothApp(QMainWindow):
         layout = QVBoxLayout(screen)
         layout.setAlignment(Qt.AlignCenter)
         layout.setSpacing(20)
+        layout.setContentsMargins(20, 20, 20, 20)
 
         title = QLabel("BẠN CÓ ĐỒNG Ý VỚI MẪU NÀY KHÔNG?")
         title.setObjectName("TitleLabel")
@@ -469,6 +925,38 @@ class PhotoboothApp(QMainWindow):
     # LOGIC ĐIỀU KHIỂN
     # ==========================================
 
+    def go_to_price_select(self):
+        """Chuyển sang màn hình chọn giá tiền."""
+        self.state = "PRICE_SELECT"
+        self.stacked.setCurrentIndex(1)
+
+    def select_price(self, photo_count):
+        """Xử lý khi chọn gói giá tiền."""
+        self.selected_price_type = photo_count
+        self.selected_frame_count = photo_count
+        
+        # Cập nhật thông tin trên màn hình QR
+        if photo_count == 2:
+            self.selected_package_label.setText(f"📦 GÓI 2 ẢNH - {PRICE_2_PHOTOS}")
+            qr_amount = "20000"
+        else:
+            self.selected_package_label.setText(f"📦 GÓI 4 ẢNH - {PRICE_4_PHOTOS}")
+            qr_amount = "35000"
+        
+        # Tạo QR code
+        qr_content = f"https://momosv3.apimienphi.com/api/QRCode?phone=0123456789&amount={qr_amount}&note=Photobooth{photo_count}Anh"
+        qr_pixmap = generate_qr_code(qr_content, 300)
+        self.qr_label.setPixmap(qr_pixmap)
+        
+        # Chuyển sang màn hình QR
+        self.state = "QR_PAYMENT"
+        self.stacked.setCurrentIndex(2)
+
+    def confirm_payment(self):
+        """Xác nhận đã thanh toán và bắt đầu chụp ảnh."""
+        self.payment_confirmed = True
+        self.start_capture_session()
+
     def load_templates(self):
         """Load danh sách templates."""
         templates = []
@@ -496,10 +984,9 @@ class PhotoboothApp(QMainWindow):
         self.state = "CAPTURING"
         self.captured_photos = []
         self.selected_photo_indices = []
-        self.selected_frame_count = 0
         
         # Chuyển sang màn hình chụp
-        self.stacked.setCurrentIndex(1)
+        self.stacked.setCurrentIndex(3)
         
         # Bắt đầu đếm ngược cho ảnh đầu tiên (10 giây)
         self.countdown_val = FIRST_PHOTO_DELAY
@@ -538,38 +1025,16 @@ class PhotoboothApp(QMainWindow):
                 self.countdown_label.setText("✓")
                 self.status_label.setText("Hoàn thành!")
                 
-                # Chuyển sang chọn kiểu khung sau 1 giây
-                QTimer.singleShot(1000, self.go_to_frame_select)
-
-    def go_to_frame_select(self):
-        """Chuyển sang màn hình chọn kiểu khung."""
-        self.state = "FRAME_SELECT"
-        
-        # Reset trạng thái các nút
-        for btn in self.frame_buttons:
-            btn.setChecked(False)
-        self.btn_confirm_frame.setEnabled(False)
-        self.selected_frame_count = 0
-        
-        self.stacked.setCurrentIndex(2)
-
-    def select_frame_type(self, count, button):
-        """Xử lý khi chọn kiểu khung."""
-        # Bỏ check các nút khác
-        for btn in self.frame_buttons:
-            if btn != button:
-                btn.setChecked(False)
-        
-        self.selected_frame_count = count
-        self.btn_confirm_frame.setEnabled(True)
+                # Chuyển thẳng sang chọn ảnh (bỏ qua chọn kiểu khung vì đã chọn trước)
+                QTimer.singleShot(1000, self.go_to_photo_select)
 
     def go_to_photo_select(self):
         """Chuyển sang màn hình chọn ảnh."""
         self.state = "PHOTO_SELECT"
         self.selected_photo_indices = []
         
-        # Cập nhật title
-        self.photo_select_title.setText(f"CHỌN {self.selected_frame_count} ẢNH")
+        # Cập nhật title dựa trên gói đã chọn
+        self.photo_select_title.setText(f"CHỌN {self.selected_frame_count} ẢNH CHO KHUNG {self.selected_frame_count} ẢNH")
         
         # Clear grid cũ
         for i in reversed(range(self.photo_grid_layout.count())):
@@ -609,7 +1074,7 @@ class PhotoboothApp(QMainWindow):
             self.photo_buttons.append(btn)
         
         self.btn_confirm_photos.setEnabled(False)
-        self.stacked.setCurrentIndex(3)
+        self.stacked.setCurrentIndex(4)
 
     def toggle_photo(self, index, button):
         """Xử lý chọn/bỏ chọn ảnh."""
@@ -641,13 +1106,12 @@ class PhotoboothApp(QMainWindow):
         self.go_to_template_select()
 
     def create_collage(self, images):
-        """Tạo collage từ các ảnh đã chọn."""
+        """Tạo collage từ các ảnh đã chọn (chỉ 2 hoặc 4 ảnh)."""
         canvas = np.zeros((720, 1280, 3), dtype=np.uint8)
         count = len(images)
         
-        if count == 1:
-            canvas = cv2.resize(images[0], (1280, 720))
-        elif count == 2:
+        if count == 2:
+            # 2 ảnh: đặt cạnh nhau
             for i, img in enumerate(images):
                 h, w = img.shape[:2]
                 center_x = w // 2
@@ -657,6 +1121,7 @@ class PhotoboothApp(QMainWindow):
                 cropped = cv2.resize(cropped, (640, 720))
                 canvas[0:720, i*640:(i+1)*640] = cropped
         elif count == 4:
+            # 4 ảnh: 2x2 grid
             for i, img in enumerate(images):
                 resized = cv2.resize(img, (640, 360))
                 row = i // 2
@@ -690,7 +1155,7 @@ class PhotoboothApp(QMainWindow):
             btn.clicked.connect(lambda checked, p=path: self.apply_template(p))
             self.template_btn_layout.addWidget(btn)
         
-        self.stacked.setCurrentIndex(4)
+        self.stacked.setCurrentIndex(5)
 
     def update_template_preview(self):
         """Cập nhật preview."""
@@ -729,7 +1194,7 @@ class PhotoboothApp(QMainWindow):
             )
             self.final_preview_label.setPixmap(scaled)
         
-        self.stacked.setCurrentIndex(5)
+        self.stacked.setCurrentIndex(6)
 
     def accept_and_print(self):
         """Đồng ý và tiến hành in ảnh."""
@@ -754,6 +1219,10 @@ class PhotoboothApp(QMainWindow):
         filepath = os.path.join(OUTPUT_DIR, filename)
         
         cv2.imwrite(filepath, self.merged_image)
+        
+        # Cập nhật carousel với ảnh mới
+        self.gallery_photos = load_sample_photos()
+        self.load_carousel_photos()
         
         # In ảnh
         try:
@@ -784,6 +1253,8 @@ class PhotoboothApp(QMainWindow):
         self.selected_frame_count = 0
         self.collage_image = None
         self.merged_image = None
+        self.payment_confirmed = False
+        self.selected_price_type = 0
         
         # Về màn hình bắt đầu
         self.stacked.setCurrentIndex(0)
@@ -792,6 +1263,10 @@ class PhotoboothApp(QMainWindow):
         """Cleanup khi đóng app."""
         self.camera_timer.stop()
         self.countdown_timer.stop()
+        if hasattr(self, 'carousel1'):
+            self.carousel1.scroll_timer.stop()
+        if hasattr(self, 'carousel2'):
+            self.carousel2.scroll_timer.stop()
         self.cap.release()
         event.accept()
 
